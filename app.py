@@ -86,6 +86,24 @@ def send_briefing():
     return resp
 
 
+def build_reply_text(texto_recebido: str) -> str:
+    if texto_recebido.startswith("/start"):
+        return (
+            "Ola! Sou o seu bot de briefing matinal. "
+            "Todo dia as 6h eu te mando agenda, tarefas, treino e um checklist fitness.\n\n"
+            "Pode me responder a qualquer momento com suas informacoes "
+            "(sono, FC de repouso, nivel de estresse) que eu registro por aqui."
+        )
+
+    if not texto_recebido:
+        return "Recebi sua mensagem (sem texto). Se quiser, me mande sono/FC/estresse em texto."
+
+    return (
+        f'Recebido: "{texto_recebido}"\n\n'
+        f"Obrigado! Em breve isso vai alimentar automaticamente o projeto Fitness."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -121,6 +139,19 @@ def webhook_receive():
 
     data = request.get_json(silent=True) or {}
     logger.info("Evento recebido no webhook: %s", data)
+
+    message = data.get("message") or data.get("edited_message")
+    if message:
+        chat_id = message.get("chat", {}).get("id")
+        texto_recebido = (message.get("text") or "").strip()
+
+        if chat_id:
+            try:
+                resposta = build_reply_text(texto_recebido)
+                send_telegram_text(chat_id, resposta)
+            except Exception:  # noqa: BLE001
+                logger.exception("Erro ao responder mensagem recebida no webhook")
+
     # TODO: aqui e onde as respostas do checklist (sono/FC/estresse)
     # podem ser capturadas e encaminhadas para o projeto Fitness.
     return jsonify({"status": "received"}), 200
