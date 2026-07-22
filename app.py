@@ -1,6 +1,7 @@
 import os
+import re
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 import pytz
@@ -22,8 +23,13 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 WEBHOOK_VERIFY_TOKEN = os.environ.get("WEBHOOK_VERIFY_TOKEN")  # opcional, para proteger o /webhook
+DATABASE_URL = os.environ.get("DATABASE_URL")  # Postgres do Railway (persiste o checklist)
 
 TIMEZONE = pytz.timezone("America/Sao_Paulo")
+
+# Coordenadas usadas para a previsao do tempo (Rio de Janeiro por padrao).
+LATITUDE = os.environ.get("BRIEFING_LAT", "-22.9068")
+LONGITUDE = os.environ.get("BRIEFING_LON", "-43.1729")
 
 WORKOUT_PLAN = {
     0: "Pernas (agachamento, leg press, cadeira extensora)",       # Monday
@@ -36,6 +42,183 @@ WORKOUT_PLAN = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Banco de dados (Postgres) — historico do checklist fitness
+# ---------------------------------------------------------------------------
+def get_db_conn():
+    import psycopg2
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+
+def init_db():
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL nao configurada — checklist nao sera salvo.")
+        return
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS checklist (
+                id SERIAL PRIMARY KEY,
+                dia DATE NOT NULL,
+                texto TEXT,
+                sono NUMERIC,
+                fc INTEGER,
+                estresse INTEGER,
+                criado_em TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Banco de dados inicializado (tabela checklist ok).")
+    except Exception:  # noqa: BLE001
+        logger.exception("Erro ao inicializar o banco de dados")
+
+
+def parse_checklist(texto: str):
+    sono = fc = estresse = None
+
+    m = re.search(r"(\d+[.,]?\d*)\s*h(oras)?", texto, re.IGNORECASE)
+    if m:
+        sono = float(m.group(1).replace(",", "."))
+
+    m = re.search(r"fc\D{0,6}(\d{2,3})", texto, re.IGNORECASE)
+    if m:
+        fc = int(m.group(1))
+
+    m = re.search(r"estr[eé]sse\D{0,6}(\d)", texto, re.IGNORECASE)
+    if m:
+        estresse = int(m.group(1))
+
+    return sono, fc, estresse
+
+
+def save_checklist(texto: str):
+    if not DATABASE_URL:
+        return
+    sono, fc, estresse = parse_checklist(texto)
+    hoje = datetime.now(TIMEZONE).date()
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO checklist (dia, texto, sono, fc, estresse) VALUES (%s, %s, %s, %s, %s)",
+            (hoje, texto, sono, fc, estresse),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("Erro ao salvar checklist no banco")
+
+
+def has_checklist_today() -> bool:
+    if not DATABASE_URL:
+        return True  # sem banco, nao bloqueia o lembrete
+    hoje = datetime.now(TIMEZONE).date()
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM checklist WHERE dia = %s", (hoje,))
+        count = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        return count > 0
+    except Exception:  # noqa: BLE001
+        logger.exception("Erro ao verificar checklist do dia")
+        return True
+
+
+def get_streak() -> int:
+    if not DATABASE_URL:
+        return 0
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT dia FROM checklist ORDER BY dia DESC")
+        dias = [r[0] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("Erro ao calcular streak")
+        return 0
+
+    streak = 0
+    esperado = datetime.now(TIMEZONE).date()
+    for d in dias:
+        if d == esperado:
+            streak += 1
+            esperado -= timedelta(days=1)
+        else:
+            break
+    return streak
+
+
+def get_weekly_summary() -> str:
+    if not DATABASE_URL:
+        return "Banco de dados ainda nao configurado — nao tenho historico pra resumir."
+
+    desde = datetime.now(TIMEZONE).date() - timedelta(days=7)
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT sono, fc, estresse FROM checklist WHERE dia >= %s",
+            (desde,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("Erro ao buscar resumo semanal")
+        return "Deu erro ao consultar seu historico. Tenta de novo mais tarde."
+
+    if not rows:
+        return "Sem registros de checklist na ultima semana ainda."
+
+    sonos = [r[0] for r in rows if r[0] is not None]
+    fcs = [r[1] for r in rows if r[1] is not None]
+    estresses = [r[2] for r in rows if r[2] is not None]
+
+    partes = [f"*Resumo dos ultimos 7 dias* ({len(rows)} registro(s)):"]
+    if sonos:
+        partes.append(f"Sono medio: {sum(sonos) / len(sonos):.1f}h")
+    if fcs:
+        partes.append(f"FC media de repouso: {sum(fcs) / len(fcs):.0f}bpm")
+    if estresses:
+        partes.append(f"Estresse medio: {sum(estresses) / len(estresses):.1f}/5")
+    partes.append(f"Streak atual: {get_streak()} dia(s) seguidos")
+    return "\n".join(partes)
+
+
+# ---------------------------------------------------------------------------
+# Previsao do tempo (Open-Meteo — gratuito, sem necessidade de API key)
+# ---------------------------------------------------------------------------
+def get_weather_text() -> str:
+    try:
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={LATITUDE}&longitude={LONGITUDE}"
+            "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+            "&timezone=America%2FSao_Paulo"
+        )
+        resp = requests.get(url, timeout=10)
+        dados = resp.json()
+        tmax = dados["daily"]["temperature_2m_max"][0]
+        tmin = dados["daily"]["temperature_2m_min"][0]
+        chuva = dados["daily"]["precipitation_probability_max"][0]
+        return f"Min {tmin:.0f}°C / Max {tmax:.0f}°C, chance de chuva {chuva}%"
+    except Exception:  # noqa: BLE001
+        logger.exception("Erro ao buscar previsao do tempo")
+        return "(nao foi possivel obter a previsao do tempo agora)"
+
+
+# ---------------------------------------------------------------------------
+# Conteudo do briefing
+# ---------------------------------------------------------------------------
 def get_workout_of_day(weekday: int) -> str:
     return WORKOUT_PLAN.get(weekday, "Descanso")
 
@@ -46,8 +229,9 @@ def build_briefing_text() -> str:
     data_str = now.strftime("%A, %d/%m/%Y")
 
     workout = get_workout_of_day(weekday)
+    clima = get_weather_text()
 
-    # TODO: substituir os blocos abaixo por integrações reais
+    # TODO: substituir os blocos abaixo por integracoes reais
     # (Google Calendar, task tracker, plano de dieta) quando disponiveis.
     agenda = "- (conectar agenda para listar os compromissos de hoje)"
     tarefas = "- (conectar lista de tarefas para listar pendencias)"
@@ -55,6 +239,7 @@ def build_briefing_text() -> str:
 
     texto = (
         f"*Bom dia, Caio!* ({data_str})\n\n"
+        f"*Clima hoje:*\n{clima}\n\n"
         f"*Agenda de hoje:*\n{agenda}\n\n"
         f"*Tarefas pendentes:*\n{tarefas}\n\n"
         f"*Treino do dia:*\n{workout}\n\n"
@@ -86,21 +271,73 @@ def send_briefing():
     return resp
 
 
+def send_evening_reminder():
+    if has_checklist_today():
+        logger.info("Checklist de hoje ja preenchido, sem lembrete noturno.")
+        return
+    texto = (
+        "Ainda nao recebi seu checklist fitness de hoje "
+        "(sono / FC de repouso / nivel de estresse).\n\n"
+        "Manda quando puder, mesmo que seja rapido — ajuda a manter o streak!"
+    )
+    send_telegram_text(TELEGRAM_CHAT_ID, texto)
+
+
+# ---------------------------------------------------------------------------
+# Respostas do bot a mensagens recebidas
+# ---------------------------------------------------------------------------
 def build_reply_text(texto_recebido: str) -> str:
-    if texto_recebido.startswith("/start"):
+    comando = texto_recebido.strip().lower()
+
+    if comando.startswith("/start"):
         return (
             "Ola! Sou o seu bot de briefing matinal. "
-            "Todo dia as 6h eu te mando agenda, tarefas, treino e um checklist fitness.\n\n"
-            "Pode me responder a qualquer momento com suas informacoes "
-            "(sono, FC de repouso, nivel de estresse) que eu registro por aqui."
+            "Todo dia as 6h eu te mando agenda, tarefas, treino, clima e um checklist fitness.\n\n"
+            "Comandos disponiveis:\n"
+            "/treino — treino de hoje\n"
+            "/briefing — manda o briefing completo agora\n"
+            "/resumo — resumo dos ultimos 7 dias do checklist\n\n"
+            "Fora isso, pode me responder a qualquer momento com sono/FC/estresse "
+            "(ex: '7h, FC 58, estresse 2') que eu registro tudo."
         )
 
+    if comando.startswith("/treino"):
+        now = datetime.now(TIMEZONE)
+        dia_semana = now.strftime("%A")
+        return f"*Treino de hoje* ({dia_semana}):\n{get_workout_of_day(now.weekday())}"
+
+    if comando.startswith("/briefing"):
+        return build_briefing_text()
+
+    if comando.startswith("/resumo"):
+        return get_weekly_summary()
+
     if not texto_recebido:
-        return "Recebi sua mensagem (sem texto). Se quiser, me mande sono/FC/estresse em texto."
+        return "Recebi sua mensagem (sem texto). Se quiser, me manda sono/FC/estresse em texto."
+
+    # Assume que e uma resposta do checklist fitness.
+    save_checklist(texto_recebido)
+    sono, fc, estresse = parse_checklist(texto_recebido)
+
+    detectados = []
+    if sono is not None:
+        detectados.append(f"sono: {sono}h")
+    if fc is not None:
+        detectados.append(f"FC: {fc}bpm")
+    if estresse is not None:
+        detectados.append(f"estresse: {estresse}/5")
+
+    if detectados:
+        detectado_str = ", ".join(detectados)
+        return (
+            f"Registrado! ({detectado_str})\n\n"
+            f"Streak atual: {get_streak()} dia(s). Manda /resumo pra ver sua semana."
+        )
 
     return (
         f'Recebido: "{texto_recebido}"\n\n'
-        f"Obrigado! Em breve isso vai alimentar automaticamente o projeto Fitness."
+        "Salvei no seu historico. Se quiser me contar sono/FC/estresse em numeros "
+        "(ex: '7h, FC 58, estresse 2'), eu consigo acompanhar sua evolucao certinho."
     )
 
 
@@ -152,8 +389,6 @@ def webhook_receive():
             except Exception:  # noqa: BLE001
                 logger.exception("Erro ao responder mensagem recebida no webhook")
 
-    # TODO: aqui e onde as respostas do checklist (sono/FC/estresse)
-    # podem ser capturadas e encaminhadas para o projeto Fitness.
     return jsonify({"status": "received"}), 200
 
 
@@ -168,11 +403,18 @@ def init_scheduler():
         id="briefing_diario",
         replace_existing=True,
     )
+    scheduler.add_job(
+        send_evening_reminder,
+        trigger=CronTrigger(hour=21, minute=0, timezone=TIMEZONE),
+        id="lembrete_noturno",
+        replace_existing=True,
+    )
     scheduler.start()
-    logger.info("Scheduler iniciado: briefing diario as 6h (America/Sao_Paulo).")
+    logger.info("Scheduler iniciado: briefing as 6h e lembrete noturno as 21h (America/Sao_Paulo).")
     return scheduler
 
 
+init_db()
 scheduler = init_scheduler()
 
 if __name__ == "__main__":
