@@ -17,71 +17,73 @@ logger = logging.getLogger("briefing")
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Config (from environment variables - set these in Railway, never commit .env)
+# Config (from environment variables — set these in Railway, never commit .env)
 # ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-WEBHOOK_VERIFY_TOKEN = os.environ.get("WEBHOOK_VERIFY_TOKEN")
+WEBHOOK_VERIFY_TOKEN = os.environ.get("WEBHOOK_VERIFY_TOKEN")  # opcional, para proteger o /webhook
 
 TIMEZONE = pytz.timezone("America/Sao_Paulo")
 
 WORKOUT_PLAN = {
-        0: "Pernas (agachamento, leg press, cadeira extensora)",
-        1: "Peito e triceps (supino, crucifixo, triceps corda)",
-        2: "Costas e biceps (puxada, remada, rosca direta)",
-        3: "Ombro e abdomen (desenvolvimento, elevacao lateral, prancha)",
-        4: "Pernas (posterior/gluteos: stiff, cadeira flexora, hip thrust)",
-        5: "Cardio leve + mobilidade",
-        6: "Descanso",
+    0: "Pernas (agachamento, leg press, cadeira extensora)",       # Monday
+    1: "Peito e triceps (supino, crucifixo, triceps corda)",       # Tuesday
+    2: "Costas e biceps (puxada, remada, rosca direta)",           # Wednesday
+    3: "Ombro e abdomen (desenvolvimento, elevacao lateral, prancha)",  # Thursday
+    4: "Pernas (posterior/gluteos: stiff, cadeira flexora, hip thrust)",  # Friday
+    5: "Cardio leve + mobilidade",                                  # Saturday
+    6: "Descanso",                                                  # Sunday
 }
 
 
-def get_workout_of_day(weekday):
-        return WORKOUT_PLAN.get(weekday, "Descanso")
+def get_workout_of_day(weekday: int) -> str:
+    return WORKOUT_PLAN.get(weekday, "Descanso")
 
 
-def build_briefing_text():
-        now = datetime.now(TIMEZONE)
-        weekday = now.weekday()
-        data_str = now.strftime("%A, %d/%m/%Y")
+def build_briefing_text() -> str:
+    now = datetime.now(TIMEZONE)
+    weekday = now.weekday()
+    data_str = now.strftime("%A, %d/%m/%Y")
 
     workout = get_workout_of_day(weekday)
 
+    # TODO: substituir os blocos abaixo por integrações reais
+    # (Google Calendar, task tracker, plano de dieta) quando disponiveis.
     agenda = "- (conectar agenda para listar os compromissos de hoje)"
     tarefas = "- (conectar lista de tarefas para listar pendencias)"
     calorias = "- (conectar plano de dieta para exibir meta de calorias/macros)"
 
     texto = (
-                f"*Bom dia, Caio!* ({data_str})\n\n"
-                f"*Agenda de hoje:*\n{agenda}\n\n"
-                f"*Tarefas pendentes:*\n{tarefas}\n\n"
-                f"*Treino do dia:*\n{workout}\n\n"
-                f"*Calorias/macros:*\n{calorias}\n\n"
-                f"*Checklist Fitness:*\n"
-                f"Responda essa mensagem com:\n"
-                f"1) Horas de sono\n"
-                f"2) FC de repouso\n"
-                f"3) Nivel de estresse (1-5)"
+        f"*Bom dia, Caio!* ({data_str})\n\n"
+        f"*Agenda de hoje:*\n{agenda}\n\n"
+        f"*Tarefas pendentes:*\n{tarefas}\n\n"
+        f"*Treino do dia:*\n{workout}\n\n"
+        f"*Calorias/macros:*\n{calorias}\n\n"
+        f"*Checklist Fitness:*\n"
+        f"Responda essa mensagem com:\n"
+        f"1) Horas de sono\n"
+        f"2) FC de repouso\n"
+        f"3) Nivel de estresse (1-5)"
     )
     return texto
 
 
-def send_telegram_text(chat_id, text):
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "Markdown",
-        }
-        response = requests.post(url, json=payload, timeout=30)
-        logger.info("Telegram API response: %s %s", response.status_code, response.text)
-        return response
+def send_telegram_text(chat_id: str, text: str) -> requests.Response:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+    }
+    response = requests.post(url, json=payload, timeout=30)
+    logger.info("Telegram API response: %s %s", response.status_code, response.text)
+    return response
 
 
 def send_briefing():
-        texto = build_briefing_text()
-        resp = send_telegram_text(TELEGRAM_CHAT_ID, texto)
-        return resp
+    texto = build_briefing_text()
+    resp = send_telegram_text(TELEGRAM_CHAT_ID, texto)
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -89,33 +91,38 @@ def send_briefing():
 # ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-        return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok"}), 200
 
 
 @app.route("/test", methods=["GET"])
 def test():
-        try:
-                    resp = send_briefing()
-                    return jsonify({
-                        "sent": resp.status_code == 200,
-                        "status_code": resp.status_code,
-                        "response": resp.json() if resp.content else None,
-                    }), (200 if resp.status_code == 200 else 502)
-except Exception as exc:
+    """Dispara o briefing manualmente, para testes."""
+    try:
+        resp = send_briefing()
+        return jsonify({
+            "sent": resp.status_code == 200,
+            "status_code": resp.status_code,
+            "response": resp.json() if resp.content else None,
+        }), (200 if resp.status_code == 200 else 502)
+    except Exception as exc:  # noqa: BLE001
         logger.exception("Erro ao enviar briefing de teste")
         return jsonify({"sent": False, "error": str(exc)}), 500
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook_receive():
-        if WEBHOOK_VERIFY_TOKEN:
-                    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-                    if secret != WEBHOOK_VERIFY_TOKEN:
-                                    logger.warning("Webhook recebido com secret token invalido.")
-                                    return "Forbidden", 403
+    # Se WEBHOOK_VERIFY_TOKEN estiver configurado, o Telegram deve enviar o mesmo
+    # valor no header X-Telegram-Bot-Api-Secret-Token (configurado via setWebhook).
+    if WEBHOOK_VERIFY_TOKEN:
+        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if secret != WEBHOOK_VERIFY_TOKEN:
+            logger.warning("Webhook recebido com secret token invalido.")
+            return "Forbidden", 403
 
-                data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True) or {}
     logger.info("Evento recebido no webhook: %s", data)
+    # TODO: aqui e onde as respostas do checklist (sono/FC/estresse)
+    # podem ser capturadas e encaminhadas para o projeto Fitness.
     return jsonify({"status": "received"}), 200
 
 
@@ -123,12 +130,12 @@ def webhook_receive():
 # Scheduler
 # ---------------------------------------------------------------------------
 def init_scheduler():
-        scheduler = BackgroundScheduler(timezone=TIMEZONE)
+    scheduler = BackgroundScheduler(timezone=TIMEZONE)
     scheduler.add_job(
-                send_briefing,
-                trigger=CronTrigger(hour=6, minute=0, timezone=TIMEZONE),
-                id="briefing_diario",
-                replace_existing=True,
+        send_briefing,
+        trigger=CronTrigger(hour=6, minute=0, timezone=TIMEZONE),
+        id="briefing_diario",
+        replace_existing=True,
     )
     scheduler.start()
     logger.info("Scheduler iniciado: briefing diario as 6h (America/Sao_Paulo).")
@@ -138,5 +145,5 @@ def init_scheduler():
 scheduler = init_scheduler()
 
 if __name__ == "__main__":
-        port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
