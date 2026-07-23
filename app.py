@@ -9,6 +9,8 @@ from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
+from icalendar import Calendar
+import recurring_ical_events
 
 load_dotenv()
 
@@ -26,6 +28,7 @@ WEBHOOK_VERIFY_TOKEN = os.environ.get("WEBHOOK_VERIFY_TOKEN")  # opcional, para 
 DATABASE_URL = os.environ.get("DATABASE_URL")  # Postgres do Railway (persiste o checklist)
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")  # token da integracao interna do Notion
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")  # id da base "Tarefas Briefing"
+GOOGLE_CALENDAR_ICS_URL = os.environ.get("GOOGLE_CALENDAR_ICS_URL")  # endereco secreto iCal
 
 TIMEZONE = pytz.timezone("America/Sao_Paulo")
 
@@ -219,6 +222,52 @@ def get_weather_text() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Agenda (Google Calendar — endereco secreto no formato iCal)
+# ---------------------------------------------------------------------------
+def _evento_inicio(evento):
+    dt = evento.get("dtstart").dt
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            dt = TIMEZONE.localize(dt)
+        return dt.astimezone(TIMEZONE)
+    return TIMEZONE.localize(datetime.combine(dt, datetime.min.time()))
+
+
+def get_agenda_text() -> str:
+    if not GOOGLE_CALENDAR_ICS_URL:
+        return "- (conectar agenda para listar os compromissos de hoje)"
+    try:
+        resp = requests.get(GOOGLE_CALENDAR_ICS_URL, timeout=15)
+        resp.raise_for_status()
+        cal = Calendar.from_ical(resp.text)
+
+        hoje = datetime.now(TIMEZONE).date()
+        inicio = TIMEZONE.localize(datetime.combine(hoje, datetime.min.time()))
+        fim = inicio + timedelta(days=1)
+
+        eventos = recurring_ical_events.of(cal).between(inicio, fim)
+        if not eventos:
+            return "- Nenhum compromisso hoje. 🎉"
+
+        eventos.sort(key=_evento_inicio)
+
+        linhas = []
+        for evento in eventos:
+            titulo = str(evento.get("summary", "(sem titulo)"))
+            dtstart = evento.get("dtstart").dt
+            if isinstance(dtstart, datetime):
+                hora = _evento_inicio(evento).strftime("%H:%M")
+                linhas.append(f"- {hora} — {titulo}")
+            else:
+                linhas.append(f"- {titulo} (dia todo)")
+
+        return "\n".join(linhas)
+    except Exception:  # noqa: BLE001
+        logger.exception("Erro ao buscar agenda do Google Calendar")
+        return "- (nao foi possivel buscar a agenda agora)"
+
+
+# ---------------------------------------------------------------------------
 # Tarefas (Notion — base "Tarefas Briefing")
 # ---------------------------------------------------------------------------
 def get_notion_tasks_text() -> str:
@@ -286,10 +335,10 @@ def build_briefing_text() -> str:
     workout = get_workout_of_day(weekday)
     clima = get_weather_text()
     tarefas = get_notion_tasks_text()
+    agenda = get_agenda_text()
 
-    # TODO: substituir os blocos abaixo por integracoes reais
-    # (Google Calendar, plano de dieta) quando disponiveis.
-    agenda = "- (conectar agenda para listar os compromissos de hoje)"
+    # TODO: substituir o bloco abaixo por integracao real
+    # (plano de dieta) quando disponivel.
     calorias = "- (conectar plano de dieta para exibir meta de calorias/macros)"
 
     texto = (

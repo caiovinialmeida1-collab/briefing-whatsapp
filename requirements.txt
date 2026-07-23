@@ -5,3 +5,5 @@ pytz
 python-dotenv
 gunicorn
 psycopg2-binary
+icalendar
+recurring-ical-events
