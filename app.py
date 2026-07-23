@@ -24,6 +24,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 WEBHOOK_VERIFY_TOKEN = os.environ.get("WEBHOOK_VERIFY_TOKEN")  # opcional, para proteger o /webhook
 DATABASE_URL = os.environ.get("DATABASE_URL")  # Postgres do Railway (persiste o checklist)
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN")  # token da integracao interna do Notion
+NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")  # id da base "Tarefas Briefing"
 
 TIMEZONE = pytz.timezone("America/Sao_Paulo")
 
@@ -217,6 +219,59 @@ def get_weather_text() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tarefas (Notion — base "Tarefas Briefing")
+# ---------------------------------------------------------------------------
+def get_notion_tasks_text() -> str:
+    if not NOTION_TOKEN or not NOTION_DATABASE_ID:
+        return "- (conectar Notion para listar pendencias)"
+    try:
+        url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+        headers = {
+            "Authorization": f"Bearer {NOTION_TOKEN}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "filter": {
+                "and": [
+                    {"property": "Status", "status": {"does_not_equal": "Done"}},
+                    {"property": "Status", "status": {"does_not_equal": "Archived"}},
+                ]
+            },
+            "sorts": [{"property": "Due", "direction": "ascending"}],
+            "page_size": 10,
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        resultados = resp.json().get("results", [])
+
+        if not resultados:
+            return "- Nenhuma tarefa pendente. 🎉"
+
+        linhas = []
+        for pagina in resultados:
+            props = pagina.get("properties", {})
+            titulo_prop = props.get("Task name", {}).get("title", [])
+            titulo = titulo_prop[0]["plain_text"] if titulo_prop else "(sem titulo)"
+
+            prazo = ""
+            due = props.get("Due", {}).get("date")
+            if due and due.get("start"):
+                try:
+                    data_prazo = datetime.fromisoformat(due["start"][:10])
+                    prazo = f" (prazo: {data_prazo.strftime('%d/%m')})"
+                except ValueError:
+                    prazo = ""
+
+            linhas.append(f"- {titulo}{prazo}")
+
+        return "\n".join(linhas)
+    except Exception:  # noqa: BLE001
+        logger.exception("Erro ao buscar tarefas no Notion")
+        return "- (nao foi possivel buscar as tarefas do Notion agora)"
+
+
+# ---------------------------------------------------------------------------
 # Conteudo do briefing
 # ---------------------------------------------------------------------------
 def get_workout_of_day(weekday: int) -> str:
@@ -230,11 +285,11 @@ def build_briefing_text() -> str:
 
     workout = get_workout_of_day(weekday)
     clima = get_weather_text()
+    tarefas = get_notion_tasks_text()
 
     # TODO: substituir os blocos abaixo por integracoes reais
-    # (Google Calendar, task tracker, plano de dieta) quando disponiveis.
+    # (Google Calendar, plano de dieta) quando disponiveis.
     agenda = "- (conectar agenda para listar os compromissos de hoje)"
-    tarefas = "- (conectar lista de tarefas para listar pendencias)"
     calorias = "- (conectar plano de dieta para exibir meta de calorias/macros)"
 
     texto = (
